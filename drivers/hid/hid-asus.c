@@ -102,6 +102,8 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 #define QUIRK_ROG_ALLY_XPAD		BIT(13)
 #define QUIRK_HID_FN_LOCK		BIT(14)
 #define QUIRK_FILTER_CAMERA_COMPANION	BIT(15)
+#define QUIRK_KBD_REPORT_SIZE		BIT(16)
+#define QUIRK_KBD_DIRECT_LED		BIT(17)
 
 #define I2C_KEYBOARD_QUIRKS			(QUIRK_FIX_NOTEBOOK_REPORT | \
 						 QUIRK_NO_INIT_REPORTS | \
@@ -176,11 +178,26 @@ struct asus_drvdata {
 	bool battery_in_query;
 	unsigned long battery_next_query;
 	struct asus_hid_listener listener;
+	struct led_classdev kbd_led_cdev;
+	bool kbd_backlight_key_handled;
 	bool fn_lock;
 	struct asus_xgm_led *xgm_led;
 };
 
 static int asus_report_battery(struct asus_drvdata *, u8 *, int);
+
+static int asus_kbd_toggle_brightness(struct asus_drvdata *drvdata)
+{
+	unsigned int brightness;
+
+	if (!drvdata->kbd_led_cdev.brightness_set_blocking)
+		return -ENODEV;
+
+	brightness = (drvdata->kbd_backlight_brightness + 1) %
+		     (drvdata->kbd_led_cdev.max_brightness + 1);
+
+	return led_set_brightness_sync(&drvdata->kbd_led_cdev, brightness);
+}
 
 static const struct asus_touchpad_info asus_i2c_tp = {
 	.max_x = 2794,
@@ -463,6 +480,25 @@ static int asus_event(struct hid_device *hdev, struct hid_field *field,
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	int ret;
 
+	if (usage->type == EV_KEY &&
+	    usage->code == KEY_KBDILLUMTOGGLE &&
+	    (drvdata->quirks & QUIRK_KBD_DIRECT_LED)) {
+		if (!value) {
+			if (drvdata->kbd_backlight_key_handled) {
+				drvdata->kbd_backlight_key_handled = false;
+				return 1;
+			}
+		} else if (drvdata->kbd_backlight_key_handled) {
+			return 1;
+		} else if (value == 1) {
+			ret = asus_kbd_toggle_brightness(drvdata);
+			if (!ret) {
+				drvdata->kbd_backlight_key_handled = true;
+				return 1;
+			}
+		}
+	}
+
 	if ((usage->hid & HID_USAGE_PAGE) == HID_UP_ASUSVENDOR &&
 	    (usage->hid & HID_USAGE) != 0x00 &&
 	    (usage->hid & HID_USAGE) != 0xff && !usage->type) {
@@ -584,16 +620,24 @@ static int asus_raw_event(struct hid_device *hdev,
 
 static int asus_kbd_set_report(struct hid_device *hdev, const u8 *buf, size_t buf_size)
 {
-	u8 *dmabuf __free(kfree) = kmemdup(buf, buf_size, GFP_KERNEL);
+	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
+	size_t report_size = buf_size;
+
+	if (drvdata->quirks & QUIRK_KBD_REPORT_SIZE)
+		report_size = max_t(size_t, report_size,
+				    FEATURE_KBD_REPORT_SIZE);
+
+	u8 *dmabuf __free(kfree) = kzalloc(report_size, GFP_KERNEL);
 	if (!dmabuf)
 		return -ENOMEM;
+	memcpy(dmabuf, buf, buf_size);
 
 	/*
 	 * The report ID should be set from the incoming buffer due to LED and key
 	 * interfaces having different pages
 	 */
-	return hid_hw_raw_request(hdev, buf[0], dmabuf, buf_size, HID_FEATURE_REPORT,
-				  HID_REQ_SET_REPORT);
+	return hid_hw_raw_request(hdev, buf[0], dmabuf, report_size,
+				  HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
 }
 
 static int asus_kbd_init(struct hid_device *hdev, u8 report_id)
@@ -698,7 +742,7 @@ static void asus_kbd_set_fn_lock(struct hid_device *hdev, bool enabled)
 		hid_err(hdev, "Asus failed to set fn lock: %d\n", ret);
 }
 
-static void asus_kbd_set_brightness(struct hid_device *hdev, u8 brightness)
+static int asus_kbd_set_brightness(struct hid_device *hdev, u8 brightness)
 {
 	const u8 buf[FEATURE_KBD_REPORT_SIZE] = {
 		FEATURE_KBD_REPORT_ID, 0xba, 0xc5, 0xc4, brightness
@@ -708,6 +752,38 @@ static void asus_kbd_set_brightness(struct hid_device *hdev, u8 brightness)
 	ret = asus_kbd_set_report(hdev, buf, sizeof(buf));
 	if (ret < 0)
 		hid_err(hdev, "Asus failed to set keyboard backlight: %d\n", ret);
+
+	return ret;
+}
+
+static int asus_kbd_init_backlight(struct hid_device *hdev)
+{
+	const u8 buf[] = {
+		FEATURE_KBD_REPORT_ID, 0xd0, 0x8f, 0x01
+	};
+	int ret;
+
+	ret = asus_kbd_set_report(hdev, buf, sizeof(buf));
+	if (ret < 0)
+		hid_err(hdev, "Asus failed to initialize keyboard backlight: %d\n",
+			ret);
+
+	return ret;
+}
+
+static int asus_kbd_set_brightness_blocking(struct led_classdev *led_cdev,
+					    enum led_brightness brightness)
+{
+	struct asus_drvdata *drvdata = container_of(led_cdev, struct asus_drvdata,
+						      kbd_led_cdev);
+	int ret;
+
+	ret = asus_kbd_set_brightness(drvdata->hdev, brightness);
+	if (ret < 0)
+		return ret;
+
+	drvdata->kbd_backlight_brightness = brightness;
+	return 0;
 }
 
 static void asus_kbd_wmi_fan(struct hid_device *hdev, struct hid_raw_event_data *data)
@@ -1003,6 +1079,26 @@ static int asus_kbd_register_leds(struct hid_device *hdev)
 
 	drvdata->listener.brightness_set = asus_kbd_backlight_set;
 	ret = asus_hid_register_listener(&drvdata->listener);
+	if (ret == -ENODEV && (drvdata->quirks & QUIRK_KBD_DIRECT_LED)) {
+		drvdata->listener.brightness_set = NULL;
+
+		ret = asus_kbd_init_backlight(hdev);
+		if (ret < 0)
+			return ret;
+
+		drvdata->kbd_led_cdev.name = "asus::kbd_backlight";
+		drvdata->kbd_led_cdev.max_brightness = 3;
+		drvdata->kbd_led_cdev.brightness_set_blocking =
+			asus_kbd_set_brightness_blocking;
+
+		ret = led_classdev_register(&hdev->dev, &drvdata->kbd_led_cdev);
+		if (ret < 0) {
+			hid_err(hdev, "Unable to register kbd brightness LED: %d\n", ret);
+			drvdata->kbd_led_cdev.brightness_set_blocking = NULL;
+		}
+
+		return ret;
+	}
 	if (ret < 0) {
 		hid_err(hdev, "Unable to register kbd brightness listener: %d\n", ret);
 		drvdata->listener.brightness_set = NULL;
@@ -1662,6 +1758,8 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 err_stop_hw:
 	if (drvdata->listener.brightness_set)
 		asus_hid_unregister_listener(&drvdata->listener);
+	if (drvdata->kbd_led_cdev.brightness_set_blocking)
+		led_classdev_unregister(&drvdata->kbd_led_cdev);
 
 	if (drvdata->xgm_led)
 		devm_led_classdev_unregister(&hdev->dev, &drvdata->xgm_led->cdev);
@@ -1677,6 +1775,8 @@ static void asus_remove(struct hid_device *hdev)
 
 	if (drvdata->listener.brightness_set)
 		asus_hid_unregister_listener(&drvdata->listener);
+	if (drvdata->kbd_led_cdev.brightness_set_blocking)
+		led_classdev_unregister(&drvdata->kbd_led_cdev);
 
 	if (drvdata->xgm_led)
 		devm_led_classdev_unregister(&hdev->dev, &drvdata->xgm_led->cdev);
@@ -1803,6 +1903,11 @@ static const struct hid_device_id asus_devices[] = {
 	{ HID_I2C_DEVICE(USB_VENDOR_ID_ASUSTEK,
 		USB_DEVICE_ID_ASUSTEK_I2C_ZENBOOK_KEYBOARD),
 	  I2C_KEYBOARD_QUIRKS | QUIRK_FILTER_CAMERA_COMPANION },
+	{ HID_I2C_DEVICE(USB_VENDOR_ID_ASUSTEK,
+		USB_DEVICE_ID_ASUSTEK_I2C_ZENBOOK_A14_KEYBOARD),
+	  I2C_KEYBOARD_QUIRKS | QUIRK_USE_KBD_BACKLIGHT |
+	  QUIRK_KBD_REPORT_SIZE | QUIRK_KBD_DIRECT_LED |
+	  QUIRK_FILTER_CAMERA_COMPANION },
 	{ HID_I2C_DEVICE(USB_VENDOR_ID_ASUSTEK,
 		USB_DEVICE_ID_ASUSTEK_I2C_TOUCHPAD), I2C_TOUCHPAD_QUIRKS },
 	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
