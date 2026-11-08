@@ -243,7 +243,8 @@ static ssize_t profile_store(struct device *dev,
 			return ret;
 	}
 
-	sysfs_notify(acpi_kobj, NULL, "platform_profile");
+	if (acpi_kobj)
+		sysfs_notify(acpi_kobj, NULL, "platform_profile");
 
 	return count;
 }
@@ -458,7 +459,8 @@ static ssize_t platform_profile_store(struct kobject *kobj,
 			return ret;
 	}
 
-	sysfs_notify(acpi_kobj, NULL, "platform_profile");
+	if (acpi_kobj)
+		sysfs_notify(acpi_kobj, NULL, "platform_profile");
 
 	return count;
 }
@@ -493,7 +495,8 @@ void platform_profile_notify(struct device *dev)
 	scoped_cond_guard(mutex_intr, return, &profile_lock) {
 		_notify_class_profile(dev, NULL);
 	}
-	sysfs_notify(acpi_kobj, NULL, "platform_profile");
+	if (acpi_kobj)
+		sysfs_notify(acpi_kobj, NULL, "platform_profile");
 }
 EXPORT_SYMBOL_GPL(platform_profile_notify);
 
@@ -540,7 +543,8 @@ int platform_profile_cycle(void)
 			return err;
 	}
 
-	sysfs_notify(acpi_kobj, NULL, "platform_profile");
+	if (acpi_kobj)
+		sysfs_notify(acpi_kobj, NULL, "platform_profile");
 
 	return 0;
 }
@@ -615,11 +619,13 @@ struct device *platform_profile_register(struct device *dev, const char *name,
 	scoped_guard(mutex, &profile_lock)
 		list_add_tail(&to_pprof_handler(ppdev)->node, &profile_handlers);
 
-	sysfs_notify(acpi_kobj, NULL, "platform_profile");
+	if (acpi_kobj) {
+		sysfs_notify(acpi_kobj, NULL, "platform_profile");
 
-	err = sysfs_update_group(acpi_kobj, &platform_profile_group);
-	if (err)
-		goto cleanup_cur;
+		err = sysfs_update_group(acpi_kobj, &platform_profile_group);
+		if (err)
+			goto cleanup_cur;
+	}
 
 	return ppdev;
 
@@ -657,8 +663,10 @@ void platform_profile_remove(struct device *dev)
 	ida_free(&platform_profile_ida, pprof->minor);
 	device_unregister(&pprof->dev);
 
-	sysfs_notify(acpi_kobj, NULL, "platform_profile");
-	sysfs_update_group(acpi_kobj, &platform_profile_group);
+	if (acpi_kobj) {
+		sysfs_notify(acpi_kobj, NULL, "platform_profile");
+		sysfs_update_group(acpi_kobj, &platform_profile_group);
+	}
 }
 EXPORT_SYMBOL_GPL(platform_profile_remove);
 
@@ -706,23 +714,23 @@ static int __init platform_profile_init(void)
 {
 	int err;
 
-	if (acpi_disabled)
-		return -EOPNOTSUPP;
-
 	err = class_register(&platform_profile_class);
 	if (err)
 		return err;
 
-	err = sysfs_create_group(acpi_kobj, &platform_profile_group);
-	if (err)
-		class_unregister(&platform_profile_class);
+	if (acpi_kobj) {
+		err = sysfs_create_group(acpi_kobj, &platform_profile_group);
+		if (err)
+			class_unregister(&platform_profile_class);
+	}
 
 	return err;
 }
 
 static void __exit platform_profile_exit(void)
 {
-	sysfs_remove_group(acpi_kobj, &platform_profile_group);
+	if (acpi_kobj)
+		sysfs_remove_group(acpi_kobj, &platform_profile_group);
 	class_unregister(&platform_profile_class);
 }
 module_init(platform_profile_init);
