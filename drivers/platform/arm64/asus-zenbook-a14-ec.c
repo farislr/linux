@@ -7,6 +7,7 @@
  */
 // allow: SIZE_OK - I2C lifecycle and hwmon callbacks share EC state.
 
+#include <linux/cpufreq.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/hwmon.h>
@@ -15,6 +16,9 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/platform_profile.h>
+#include <linux/pm.h>
+#include <linux/pm_qos.h>
 
 #define DRV_NAME		"asus-zenbook-a14-ec"
 #define HWMON_NAME		"asus_zenbook_a14_ec"
@@ -41,6 +45,7 @@
 #define EC_REG_FAN_TACH_MIN	0x09	/* RPM = value × 88 */
 #define EC_REG_PWM_MAJ		0x01
 #define EC_REG_PWM_RMIN		0x0a	/* read:  0-255 */
+#define EC_REG_PWM_WMIN		0x8a	/* write: 0-255 */
 #define EC_REG_FAN_SEL_WMIN	0x8c	/* fan-id selector for PWM/tach */
 #define EC_REG_TEMP_MAJ		0x05
 #define EC_REG_TEMP_MIN		0x02	/* °C */
@@ -50,15 +55,30 @@
 /* Tach-to-RPM conversion: empirically RPM ≈ tach × 88. */
 #define EC_TACH_RPM_MULT	88
 
+/* PWM floor below which the fan does not spin. */
+#define EC_PWM_SPIN_FLOOR	0x4b	/* 75 */
+
 /* Fan mode encoding observed in (0x01, 0x02). */
 #define EC_FAN_MODE_AUTO	0
 #define EC_FAN_MODE_MANUAL	2
+
+/* CPU frequency capping for quiet profile (kHz). */
+#define PP_QUIET_FREQ_KHZ	1440000
+#define PP_MAX_FREQ_KHZ		3417600
+#define PP_MAX_POLICIES		4
 
 struct asus_ec {
 	struct device		*dev;
 	struct i2c_client	*client;
 	struct mutex		lock;		/* serialises EC compound access */
 	struct mutex		mode_lock;
+	bool			manual_active;
+
+	struct device		*profile_dev;
+	enum platform_profile_option pp_active;
+
+	struct freq_qos_request	freq_req[PP_MAX_POLICIES];
+	int			n_freq_req;
 
 	/* DMA-safe scratch (kmalloc-backed via devm_kzalloc) */
 	u8			tx[3];
@@ -250,6 +270,30 @@ static int asus_ec_set_fan_mode(struct asus_ec *ec, u8 mode)
 				 EC_REG_FAN_MODE_WMIN, mode);
 }
 
+static int asus_ec_set_pwm(struct asus_ec *ec, int fan_id, u8 speed)
+{
+	int ret;
+
+	mutex_lock(&ec->lock);
+	ret = __ec_cw(ec, EC_REG_PWM_MAJ, EC_REG_FAN_SEL_WMIN, fan_id);
+	if (ret)
+		goto out;
+	ret = __ec_cw(ec, EC_REG_PWM_MAJ, EC_REG_PWM_WMIN, speed);
+out:
+	mutex_unlock(&ec->lock);
+	return ret;
+}
+
+static int asus_ec_set_pwm_both(struct asus_ec *ec, u8 speed)
+{
+	int ret;
+
+	ret = asus_ec_set_pwm(ec, 0, speed);
+	if (ret)
+		return ret;
+	return asus_ec_set_pwm(ec, 1, speed);
+}
+
 static int asus_ec_read_fan_reg(struct asus_ec *ec, int fan_id,
 				 u8 reg_min, u8 *out)
 {
@@ -265,6 +309,175 @@ out:
 	return ret;
 }
 
+/* ------------------------------------------------------------------ */
+/* CPU frequency QoS                                                  */
+/* ------------------------------------------------------------------ */
+
+static void asus_ec_freq_qos_init(struct asus_ec *ec)
+{
+	struct cpufreq_policy *policy;
+	int cpu, ret;
+
+	ec->n_freq_req = 0;
+
+	for_each_possible_cpu(cpu) {
+		if (ec->n_freq_req >= PP_MAX_POLICIES)
+			break;
+
+		policy = cpufreq_cpu_get(cpu);
+		if (!policy)
+			continue;
+
+		if (cpu != cpumask_first(policy->related_cpus)) {
+			cpufreq_cpu_put(policy);
+			continue;
+		}
+
+		ret = freq_qos_add_request(&policy->constraints,
+					   &ec->freq_req[ec->n_freq_req],
+					   FREQ_QOS_MAX, PP_MAX_FREQ_KHZ);
+		cpufreq_cpu_put(policy);
+
+		if (ret < 0) {
+			dev_warn(ec->dev,
+				 "freq_qos: failed to add request for cpu%d: %d\n",
+				 cpu, ret);
+			continue;
+		}
+
+		ec->n_freq_req++;
+	}
+
+	dev_info(ec->dev, "freq_qos: %d policies registered\n", ec->n_freq_req);
+}
+
+static void asus_ec_freq_qos_cleanup(struct asus_ec *ec)
+{
+	int i;
+
+	for (i = 0; i < ec->n_freq_req; i++)
+		freq_qos_remove_request(&ec->freq_req[i]);
+	ec->n_freq_req = 0;
+}
+
+static int asus_ec_freq_qos_set(struct asus_ec *ec, s32 max_khz)
+{
+	int i, ret;
+
+	for (i = 0; i < ec->n_freq_req; i++) {
+		ret = freq_qos_update_request(&ec->freq_req[i], max_khz);
+		if (ret < 0) {
+			dev_warn(ec->dev,
+				 "freq_qos: update %d to %d kHz failed: %d\n",
+				 i, max_khz, ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* platform_profile integration                                       */
+/* ------------------------------------------------------------------ */
+
+#define PP_QUIET_PWM	0
+#define PP_PERF_PWM	180
+
+static int asus_ec_pp_probe(void *drvdata, unsigned long *choices)
+{
+	set_bit(PLATFORM_PROFILE_QUIET, choices);
+	set_bit(PLATFORM_PROFILE_BALANCED, choices);
+	set_bit(PLATFORM_PROFILE_PERFORMANCE, choices);
+	return 0;
+}
+
+static int asus_ec_pp_get(struct device *dev,
+			  enum platform_profile_option *profile)
+{
+	struct asus_ec *ec = dev_get_drvdata(dev);
+
+	*profile = ec->pp_active;
+	return 0;
+}
+
+static int asus_ec_pp_set(struct device *dev,
+			  enum platform_profile_option profile)
+{
+	struct asus_ec *ec = dev_get_drvdata(dev);
+	int ret;
+
+	mutex_lock(&ec->mode_lock);
+
+	switch (profile) {
+	case PLATFORM_PROFILE_QUIET:
+		if (!ec->manual_active) {
+			ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
+			if (ret)
+				goto out;
+			ec->manual_active = true;
+		}
+		ret = asus_ec_set_pwm_both(ec, PP_QUIET_PWM);
+		if (ret)
+			goto out;
+		asus_ec_freq_qos_set(ec, PP_QUIET_FREQ_KHZ);
+		break;
+
+	case PLATFORM_PROFILE_BALANCED:
+		if (ec->manual_active) {
+			ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_AUTO);
+			if (ret)
+				goto out;
+			ec->manual_active = false;
+		}
+		asus_ec_freq_qos_set(ec, PP_MAX_FREQ_KHZ);
+		break;
+
+	case PLATFORM_PROFILE_PERFORMANCE:
+		if (!ec->manual_active) {
+			ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
+			if (ret)
+				goto out;
+			ec->manual_active = true;
+		}
+		ret = asus_ec_set_pwm_both(ec, PP_PERF_PWM);
+		if (ret)
+			goto out;
+		asus_ec_freq_qos_set(ec, PP_MAX_FREQ_KHZ);
+		break;
+
+	default:
+		ret = -EOPNOTSUPP;
+		goto out;
+	}
+
+	ec->pp_active = profile;
+	ret = 0;
+
+out:
+	mutex_unlock(&ec->mode_lock);
+	return ret;
+}
+
+static const struct platform_profile_ops asus_ec_pp_ops = {
+	.probe		= asus_ec_pp_probe,
+	.profile_get	= asus_ec_pp_get,
+	.profile_set	= asus_ec_pp_set,
+};
+
+/* Caller MUST hold ec->mode_lock. */
+static int asus_ec_enter_manual(struct asus_ec *ec)
+{
+	int ret;
+
+	ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
+	if (ret)
+		return ret;
+
+	ec->manual_active = true;
+	return 0;
+}
+
 /* Caller MUST hold ec->mode_lock. */
 static int asus_ec_leave_manual(struct asus_ec *ec)
 {
@@ -276,6 +489,7 @@ static int asus_ec_leave_manual(struct asus_ec *ec)
 		return ret;
 	}
 
+	ec->manual_active = false;
 	return 0;
 }
 
@@ -299,12 +513,13 @@ static umode_t asus_ec_hwmon_is_visible(const void *drvdata,
 			return 0;
 		}
 	case hwmon_pwm:
-		if (channel != 0)
+		if (channel >= EC_NUM_FANS)
 			return 0;
 		switch (attr) {
 		case hwmon_pwm_input:
+			return 0644;
 		case hwmon_pwm_enable:
-			return 0444;
+			return channel == 0 ? 0644 : 0;
 		default:
 			return 0;
 		}
@@ -385,7 +600,61 @@ static int asus_ec_hwmon_write(struct device *dev,
 			       enum hwmon_sensor_types type,
 			       u32 attr, int channel, long val)
 {
-	return -EOPNOTSUPP;
+	struct asus_ec *ec = dev_get_drvdata(dev);
+	int ret;
+	u8 speed;
+
+	if (type != hwmon_pwm)
+		return -EOPNOTSUPP;
+
+	switch (attr) {
+	case hwmon_pwm_enable:
+		mutex_lock(&ec->mode_lock);
+		switch (val) {
+		case 1:
+			if (ec->manual_active)
+				ret = 0;
+			else
+				ret = asus_ec_enter_manual(ec);
+			break;
+		case 2:
+			if (!ec->manual_active)
+				ret = 0;
+			else
+				ret = asus_ec_leave_manual(ec);
+			break;
+		default:
+			ret = -EINVAL;
+		}
+		mutex_unlock(&ec->mode_lock);
+		return ret;
+
+	case hwmon_pwm_input:
+		if (val < 0 || val > 255)
+			return -EINVAL;
+		if (channel >= EC_NUM_FANS)
+			return -EOPNOTSUPP;
+		speed = (u8)val;
+
+		mutex_lock(&ec->mode_lock);
+		if (!ec->manual_active) {
+			mutex_unlock(&ec->mode_lock);
+			return -EBUSY;
+		}
+		ret = asus_ec_set_pwm(ec, channel, speed);
+		mutex_unlock(&ec->mode_lock);
+		if (ret)
+			return ret;
+
+		if (speed > 0 && speed < EC_PWM_SPIN_FLOOR)
+			dev_info_ratelimited(ec->dev,
+				"fan%d pwm=%u below spin floor (%u); fan likely idle\n",
+				channel, speed, EC_PWM_SPIN_FLOOR);
+		return 0;
+
+	default:
+		return -EOPNOTSUPP;
+	}
 }
 
 static const char * const fan_labels[] = { "left", "right" };
@@ -426,7 +695,8 @@ static const struct hwmon_channel_info * const asus_ec_hwmon_info[] = {
 			   HWMON_F_INPUT | HWMON_F_LABEL,
 			   HWMON_F_INPUT | HWMON_F_LABEL),
 	HWMON_CHANNEL_INFO(pwm,
-			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE),
+			   HWMON_PWM_INPUT | HWMON_PWM_ENABLE,
+			   HWMON_PWM_INPUT),
 	HWMON_CHANNEL_INFO(temp,
 			   HWMON_T_INPUT | HWMON_T_LABEL),
 	NULL
@@ -483,6 +753,19 @@ static int asus_zenbook_a14_ec_probe(struct i2c_client *client)
 
 	dev_info(dev, "hwmon registered\n");
 
+	asus_ec_freq_qos_init(ec);
+	ec->pp_active = PLATFORM_PROFILE_BALANCED;
+	ec->profile_dev = devm_platform_profile_register(dev, DRV_NAME, ec,
+					    &asus_ec_pp_ops);
+	if (IS_ERR(ec->profile_dev)) {
+		dev_warn(dev, "platform_profile registration failed: %ld (continuing)\n",
+			 PTR_ERR(ec->profile_dev));
+		ec->profile_dev = NULL;
+	} else {
+		dev_info(dev,
+			 "platform_profile registered (quiet/balanced/performance)\n");
+	}
+
 	return 0;
 }
 
@@ -494,8 +777,12 @@ static void asus_zenbook_a14_ec_remove(struct i2c_client *client)
 		return;
 
 	mutex_lock(&ec->mode_lock);
-	(void)asus_ec_leave_manual(ec);
+	if (ec->manual_active)
+		(void)asus_ec_leave_manual(ec);
 	mutex_unlock(&ec->mode_lock);
+
+	asus_ec_freq_qos_set(ec, PP_MAX_FREQ_KHZ);
+	asus_ec_freq_qos_cleanup(ec);
 
 	dev_info(&client->dev, "removed\n");
 }
@@ -511,6 +798,78 @@ static void asus_zenbook_a14_ec_shutdown(struct i2c_client *client)
 	(void)asus_ec_leave_manual(ec);
 	mutex_unlock(&ec->mode_lock);
 }
+
+/* ------------------------------------------------------------------ */
+/* PM                                                                 */
+/* ------------------------------------------------------------------ */
+
+static int asus_ec_suspend(struct device *dev)
+{
+	struct asus_ec *ec = i2c_get_clientdata(to_i2c_client(dev));
+	int ret;
+
+	if (!ec)
+		return 0;
+
+	mutex_lock(&ec->mode_lock);
+
+	ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
+	if (ret)
+		dev_warn(dev, "suspend: set manual failed: %d\n", ret);
+
+	ret = asus_ec_set_pwm_both(ec, 0);
+	if (ret)
+		dev_warn(dev, "suspend: set pwm 0 (both fans) failed: %d\n", ret);
+
+	mutex_unlock(&ec->mode_lock);
+
+	return 0;
+}
+
+static int asus_ec_resume(struct device *dev)
+{
+	struct asus_ec *ec = i2c_get_clientdata(to_i2c_client(dev));
+	int ret;
+
+	if (!ec)
+		return 0;
+
+	mutex_lock(&ec->mode_lock);
+
+	switch (ec->pp_active) {
+	case PLATFORM_PROFILE_QUIET:
+		ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
+		if (!ret)
+			ret = asus_ec_set_pwm_both(ec, PP_QUIET_PWM);
+		if (ret)
+			dev_warn(dev, "resume: restore quiet failed: %d\n", ret);
+		ec->manual_active = true;
+		break;
+
+	case PLATFORM_PROFILE_PERFORMANCE:
+		ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_MANUAL);
+		if (!ret)
+			ret = asus_ec_set_pwm_both(ec, PP_PERF_PWM);
+		if (ret)
+			dev_warn(dev, "resume: perf restore failed: %d\n", ret);
+		ec->manual_active = true;
+		break;
+
+	default:
+		ret = asus_ec_set_fan_mode(ec, EC_FAN_MODE_AUTO);
+		if (ret)
+			dev_warn(dev, "resume: restore auto failed: %d\n", ret);
+		ec->manual_active = false;
+		break;
+	}
+
+	mutex_unlock(&ec->mode_lock);
+
+	return 0;
+}
+
+static SIMPLE_DEV_PM_OPS(asus_zenbook_a14_ec_pm_ops, asus_ec_suspend,
+			 asus_ec_resume);
 
 static const struct of_device_id asus_zenbook_a14_ec_of_match[] = {
 	{ .compatible = "asus,zenbook-a14-ux3407qa-ec" },
@@ -528,6 +887,7 @@ static struct i2c_driver asus_zenbook_a14_ec_driver = {
 	.driver = {
 		.name = DRV_NAME,
 		.of_match_table = asus_zenbook_a14_ec_of_match,
+		.pm = &asus_zenbook_a14_ec_pm_ops,
 	},
 	.probe = asus_zenbook_a14_ec_probe,
 	.remove = asus_zenbook_a14_ec_remove,
