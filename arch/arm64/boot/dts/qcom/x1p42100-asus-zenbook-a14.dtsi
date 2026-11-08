@@ -137,3 +137,10 @@
 		max-speed = <3000000>;
 	};
 };
+
+&i2c5 {
+	ec@5b {
+		compatible = "asus,zenbook-a14-ux3407qa-ec";
+		reg = <0x5b>;
+	};
+};
