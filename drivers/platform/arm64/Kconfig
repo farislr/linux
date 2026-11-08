@@ -142,4 +142,20 @@ config EC_QCOM_HAMOA
 
 	  This driver currently supports Hamoa/Purwa/Glymur reference devices.
 
+config EC_ASUS_ZENBOOK_A14
+	tristate "ASUS Zenbook A14 UX3407QA Embedded Controller driver"
+	depends on ARCH_QCOM || COMPILE_TEST
+	depends on I2C
+	depends on HWMON
+	depends on CPU_FREQ
+	depends on THERMAL || THERMAL=n
+	select ACPI_PLATFORM_PROFILE
+	help
+	  Driver for the ASUS Zenbook A14 UX3407QA embedded controller.
+	  Provides fan RPM, PWM, temperature, and platform_profile-based
+	  fan/CPU performance control. Experimental.
+
+	  Say M or Y here if you have an ASUS Zenbook A14 (UX3407QA) and want
+	  fan control support through the EC mailbox at I2C address 0x5b.
+
 endif # ARM64_PLATFORM_DEVICES
