@@ -108,6 +108,7 @@ struct asus_ec {
 	struct delayed_work	curve_work;
 	bool			curve_enabled;
 	bool			curve_suspended;
+	bool			curve_recovering;
 	bool			suspend_prepared;
 	unsigned int		curve_interval_ms;
 	unsigned int		curve_hysteresis_c;
@@ -323,13 +324,31 @@ static int asus_ec_set_fan_mode(struct asus_ec *ec, u8 mode)
 
 static int asus_ec_set_pwm(struct asus_ec *ec, int fan_id, u8 speed)
 {
+	u8 actual;
 	int ret;
 
 	mutex_lock(&ec->lock);
 	ret = __ec_cw(ec, EC_REG_PWM_MAJ, EC_REG_FAN_SEL_WMIN, fan_id);
 	if (ret)
 		goto out;
+	/* Let the fan selector latch before issuing the PWM command. */
+	usleep_range(EC_SETTLE_INTERVAL_US,
+		     EC_SETTLE_INTERVAL_US + 10000);
 	ret = __ec_cw(ec, EC_REG_PWM_MAJ, EC_REG_PWM_WMIN, speed);
+	if (ret)
+		goto out;
+	/* Let the EC publish the command result before verifying it. */
+	usleep_range(EC_SETTLE_INTERVAL_US,
+		     EC_SETTLE_INTERVAL_US + 10000);
+	ret = __ec_cr(ec, EC_REG_PWM_MAJ, EC_REG_PWM_RMIN, &actual);
+	if (ret)
+		goto out;
+	if (actual != speed) {
+		dev_warn_ratelimited(ec->dev,
+				     "fan%d PWM write mismatch: requested %u, read %u\n",
+				     fan_id, speed, actual);
+		ret = -EIO;
+	}
 out:
 	mutex_unlock(&ec->lock);
 	return ret;
@@ -337,12 +356,13 @@ out:
 
 static int asus_ec_set_pwm_both(struct asus_ec *ec, u8 speed)
 {
+	int first_ret;
 	int ret;
 
-	ret = asus_ec_set_pwm(ec, 0, speed);
-	if (ret)
-		return ret;
-	return asus_ec_set_pwm(ec, 1, speed);
+	first_ret = asus_ec_set_pwm(ec, 0, speed);
+	ret = asus_ec_set_pwm(ec, 1, speed);
+
+	return first_ret ? first_ret : ret;
 }
 
 /* Caller MUST hold ec->mode_lock. */
@@ -569,13 +589,20 @@ static void asus_ec_suspend_fallback_auto(struct asus_ec *ec)
 	int ret;
 
 	ret = asus_ec_force_auto(ec);
-	if (ret)
+	if (ret) {
 		dev_warn(ec->dev, "suspend: restore auto failed: %d\n", ret);
-	else
-		ec->pp_active = PLATFORM_PROFILE_BALANCED;
+		ec->curve_recovering = true;
+		ret = asus_ec_set_pwm_both(ec, U8_MAX);
+		if (ret)
+			dev_warn(ec->dev,
+				 "suspend: full-speed fallback failed: %d\n", ret);
+		return;
+	}
 
+	ec->pp_active = PLATFORM_PROFILE_BALANCED;
 	ec->curve_enabled = false;
 	ec->curve_suspended = false;
+	ec->curve_recovering = false;
 }
 
 static int asus_ec_pp_probe(void *drvdata, unsigned long *choices)
@@ -709,7 +736,11 @@ static void asus_ec_curve_apply(struct asus_ec *ec)
 
 	mutex_lock(&ec->mode_lock);
 
-	if (!ec->curve_enabled || ec->curve_suspended)
+	if (ec->curve_suspended)
+		goto out;
+	if (ec->curve_recovering)
+		goto recover;
+	if (!ec->curve_enabled)
 		goto out;
 
 	ret = asus_ec_read_temp_input(ec, &temp_mc);
@@ -718,23 +749,29 @@ static void asus_ec_curve_apply(struct asus_ec *ec)
 			 ret);
 		ec->curve_last_temp = -1;
 		ret = asus_ec_set_pwm_both(ec, U8_MAX);
-		if (ret)
-			dev_warn(ec->dev, "fan curve: full-speed write failed: %d\n", ret);
-		else
-			ec->curve_last_pwm = U8_MAX;
+		if (ret) {
+			dev_warn_ratelimited(ec->dev,
+					     "fan curve: full-speed write failed: %d\n",
+					     ret);
+			ec->curve_recovering = true;
+			goto recover;
+		}
+		ec->curve_last_pwm = U8_MAX;
 		goto reschedule;
 	}
 
 	temp_c = temp_mc / 1000;
 	if (temp_c >= EC_TEMP_CRITICAL) {
 		ret = asus_ec_set_pwm_both(ec, U8_MAX);
-		if (ret)
-			dev_warn(ec->dev,
-				 "fan curve: critical full-speed write failed: %d\n", ret);
-		else {
-			ec->curve_last_temp = temp_c;
-			ec->curve_last_pwm = U8_MAX;
+		if (ret) {
+			dev_warn_ratelimited(ec->dev,
+					     "fan curve: critical full-speed write failed: %d\n",
+					     ret);
+			ec->curve_recovering = true;
+			goto recover;
 		}
+		ec->curve_last_temp = temp_c;
+		ec->curve_last_pwm = U8_MAX;
 		goto reschedule;
 	}
 
@@ -748,13 +785,35 @@ static void asus_ec_curve_apply(struct asus_ec *ec)
 	if (ec->curve_last_temp < 0 || pwm != ec->curve_last_pwm) {
 		ret = asus_ec_set_pwm_both(ec, pwm);
 		if (ret) {
-			dev_warn(ec->dev, "fan curve: pwm write failed: %d\n", ret);
-			goto reschedule;
+			dev_warn_ratelimited(ec->dev,
+					     "fan curve: pwm write failed: %d; restoring automatic control\n",
+					     ret);
+			ec->curve_recovering = true;
+			goto recover;
 		}
 	}
 
 	ec->curve_last_temp = temp_c;
 	ec->curve_last_pwm = pwm;
+	goto reschedule;
+
+recover:
+	ret = asus_ec_force_auto(ec);
+	if (!ret) {
+		ec->curve_enabled = false;
+		ec->curve_suspended = false;
+		ec->curve_recovering = false;
+		goto out;
+	}
+
+	dev_warn_ratelimited(ec->dev,
+			     "fan curve: automatic control restore failed: %d\n",
+			     ret);
+	ret = asus_ec_set_pwm_both(ec, U8_MAX);
+	if (ret)
+		dev_warn_ratelimited(ec->dev,
+				     "fan curve: full-speed fallback failed: %d\n",
+				     ret);
 
 reschedule:
 	mod_delayed_work(system_wq, &ec->curve_work,
@@ -778,6 +837,11 @@ static int asus_ec_curve_enable(struct asus_ec *ec)
 	mutex_lock(&ec->curve_lock);
 	mutex_lock(&ec->mode_lock);
 
+	if (ec->curve_recovering) {
+		ret = -EBUSY;
+		goto out_unlock_mode;
+	}
+
 	if (!ec->curve_enabled) {
 		if (ec->manual_owner == OWNER_PLATFORM_PROFILE ||
 		    ec->manual_owner == OWNER_HWMON) {
@@ -791,6 +855,7 @@ static int asus_ec_curve_enable(struct asus_ec *ec)
 
 		ec->curve_enabled = true;
 		ec->curve_suspended = false;
+		ec->curve_recovering = false;
 		ec->curve_last_temp = -1;
 		ec->curve_last_pwm = 0;
 	}
@@ -806,7 +871,9 @@ out_unlock_mode:
 
 static int asus_ec_curve_disable(struct asus_ec *ec)
 {
-	int ret;
+	bool retry_recovery;
+	int fallback_ret;
+	int ret = 0;
 
 	mutex_lock(&ec->curve_lock);
 	mutex_lock(&ec->mode_lock);
@@ -817,11 +884,29 @@ static int asus_ec_curve_disable(struct asus_ec *ec)
 	cancel_delayed_work_sync(&ec->curve_work);
 
 	mutex_lock(&ec->mode_lock);
-	if (ec->manual_owner == OWNER_FAN_CURVE)
-		ret = asus_ec_leave_manual(ec, OWNER_FAN_CURVE);
-	else
-		ret = 0;
+	if (ec->curve_recovering ||
+	    ec->manual_owner == OWNER_FAN_CURVE) {
+		ret = asus_ec_force_auto(ec);
+		if (ret) {
+			dev_warn_ratelimited(ec->dev,
+					     "fan curve: automatic control disable failed: %d\n",
+					     ret);
+			ec->curve_recovering = true;
+			fallback_ret = asus_ec_set_pwm_both(ec, U8_MAX);
+			if (fallback_ret)
+				dev_warn_ratelimited(ec->dev,
+						     "fan curve: full-speed disable fallback failed: %d\n",
+						     fallback_ret);
+		} else {
+			ec->curve_recovering = false;
+		}
+	}
+	retry_recovery = ec->curve_recovering;
 	mutex_unlock(&ec->mode_lock);
+
+	if (retry_recovery)
+		mod_delayed_work(system_wq, &ec->curve_work,
+				 msecs_to_jiffies(ec->curve_interval_ms));
 	mutex_unlock(&ec->curve_lock);
 
 	return ret;
@@ -1342,6 +1427,7 @@ static void asus_zenbook_a14_ec_remove(struct i2c_client *client)
 
 	sysfs_remove_group(&ec->hwmon_dev->kobj, &asus_ec_curve_attr_group);
 	(void)asus_ec_curve_disable(ec);
+	cancel_delayed_work_sync(&ec->curve_work);
 
 	asus_ec_freq_qos_set(ec, PP_MAX_FREQ_KHZ);
 	asus_ec_freq_qos_cleanup(ec);
@@ -1357,6 +1443,7 @@ static void asus_zenbook_a14_ec_shutdown(struct i2c_client *client)
 		return;
 
 	(void)asus_ec_curve_disable(ec);
+	cancel_delayed_work_sync(&ec->curve_work);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1390,6 +1477,13 @@ static int asus_ec_prepare(struct device *dev)
 		if (ec->curve_enabled)
 			mod_delayed_work(system_wq, &ec->curve_work, 0);
 		goto out_unlock_mode;
+	}
+	if (ec->curve_recovering) {
+		ec->suspend_state.owner = OWNER_NONE;
+		ec->suspend_state.curve_enabled = false;
+		ec->curve_enabled = false;
+		ec->curve_suspended = false;
+		ec->curve_recovering = false;
 	}
 
 	ec->suspend_prepared = true;
@@ -1460,7 +1554,8 @@ static void asus_ec_complete(struct device *dev)
 		ec->suspend_prepared = false;
 	}
 
-	if (ec->curve_enabled && ec->curve_suspended) {
+	if (ec->curve_recovering ||
+	    (ec->curve_enabled && ec->curve_suspended)) {
 		ec->curve_suspended = false;
 		ec->curve_last_temp = -1;
 		mod_delayed_work(system_wq, &ec->curve_work, 0);
