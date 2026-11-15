@@ -306,20 +306,30 @@ static int asus_ec_read_temp_input(struct asus_ec *ec, long *temp_mc)
 	return 0;
 }
 
-static int asus_ec_write_reg(struct asus_ec *ec, u8 maj, u8 min, u8 val)
+static int asus_ec_set_fan_mode(struct asus_ec *ec, u8 mode)
 {
+	u8 actual;
 	int ret;
 
 	mutex_lock(&ec->lock);
-	ret = __ec_cw(ec, maj, min, val);
+	ret = __ec_cw(ec, EC_REG_FAN_MODE_MAJ, EC_REG_FAN_MODE_WMIN, mode);
+	if (ret)
+		goto out;
+	/* Let the EC publish the mode change before verifying it. */
+	usleep_range(EC_SETTLE_INTERVAL_US,
+		     EC_SETTLE_INTERVAL_US + 10000);
+	ret = __ec_cr(ec, EC_REG_FAN_MODE_MAJ, EC_REG_FAN_MODE_RMIN, &actual);
+	if (ret)
+		goto out;
+	if (actual != mode) {
+		dev_warn_ratelimited(ec->dev,
+				     "fan mode write mismatch: requested %u, read %u\n",
+				     mode, actual);
+		ret = -EIO;
+	}
+out:
 	mutex_unlock(&ec->lock);
 	return ret;
-}
-
-static int asus_ec_set_fan_mode(struct asus_ec *ec, u8 mode)
-{
-	return asus_ec_write_reg(ec, EC_REG_FAN_MODE_MAJ,
-				 EC_REG_FAN_MODE_WMIN, mode);
 }
 
 static int asus_ec_set_pwm(struct asus_ec *ec, int fan_id, u8 speed)
@@ -1250,10 +1260,11 @@ static int asus_ec_hwmon_write(struct device *dev,
 				ret = asus_ec_enter_manual(ec, OWNER_HWMON);
 			break;
 		case 2:
-			if (ec->manual_owner == OWNER_HWMON)
-				ret = asus_ec_leave_manual(ec, OWNER_HWMON);
+			if (ec->manual_owner == OWNER_PLATFORM_PROFILE ||
+			    ec->manual_owner == OWNER_FAN_CURVE)
+				ret = -EBUSY;
 			else
-				ret = 0;
+				ret = asus_ec_force_auto(ec);
 			break;
 		default:
 			ret = -EINVAL;
