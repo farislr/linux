@@ -21,6 +21,7 @@
  */
 
 #include <linux/acpi.h>
+#include <linux/bitops.h>
 #include <linux/cleanup.h>
 #include <linux/dmi.h>
 #include <linux/hid.h>
@@ -104,6 +105,7 @@ MODULE_DESCRIPTION("Asus HID Keyboard and TouchPad");
 #define QUIRK_FILTER_CAMERA_COMPANION	BIT(15)
 #define QUIRK_KBD_REPORT_SIZE		BIT(16)
 #define QUIRK_KBD_DIRECT_LED		BIT(17)
+#define QUIRK_KBD_SOFTWARE_FN_LOCK	BIT(18)
 
 #define I2C_KEYBOARD_QUIRKS			(QUIRK_FIX_NOTEBOOK_REPORT | \
 						 QUIRK_NO_INIT_REPORTS | \
@@ -118,6 +120,13 @@ enum asus_work_action_type {
 	FN_LOCK_SYNC,
 	BRIGHTNESS_SET,
 	WMI_FAN,
+};
+
+enum asus_software_fn_lock_meta_state {
+	ASUS_SOFTWARE_FN_LOCK_META_NONE,
+	ASUS_SOFTWARE_FN_LOCK_META_PENDING,
+	ASUS_SOFTWARE_FN_LOCK_META_REPLAYED,
+	ASUS_SOFTWARE_FN_LOCK_META_CHORD,
 };
 
 struct hid_raw_event_data {
@@ -181,6 +190,13 @@ struct asus_drvdata {
 	struct led_classdev kbd_led_cdev;
 	bool kbd_backlight_key_handled;
 	bool fn_lock;
+	bool software_fn_lock;
+	enum asus_software_fn_lock_meta_state software_fn_lock_meta_state;
+	/* The synthetic keys of the Meta+P chord which is reported for F7. */
+	bool software_fn_lock_f7_meta;
+	bool software_fn_lock_f7_p;
+	/* Key codes whose software Fn-Lock mapping is currently latched */
+	unsigned long software_fn_lock_active[BITS_TO_LONGS(KEY_CNT)];
 	struct asus_xgm_led *xgm_led;
 };
 
@@ -474,11 +490,395 @@ static int asus_kbd_wmi_fan_send(struct asus_drvdata *drvdata, u8 *report_data,
 	return 0;
 }
 
+/*
+ * Software Fn-Lock for the ASUS Zenbook A14.
+ *
+ * The A14 does not implement the Fn-Lock in hardware: neither the EC
+ * register nor the HID feature report used by other ASUS models is
+ * accepted by the firmware of this device, so the Fn-Lock is implemented
+ * in software.
+ *
+ * While the Fn-Lock is engaged the keys are reported the way the
+ * firmware reports them and the Fn layer is reached with the Fn key.
+ * While the Fn-Lock is released the Fn layer is always active: the
+ * firmware reports the Fn function of the pressed key and the driver
+ * reports the plain key of the same physical key instead.
+ */
+struct asus_software_fn_lock_pair {
+	u16 from;
+	u16 to;
+};
+
+/*
+ * The keys which are exchanged while the Fn-Lock is released, the Fn
+ * layer function of a key and the plain key of the same physical key
+ * exchange their places.
+ */
+static const struct asus_software_fn_lock_pair asus_software_fn_lock_pairs[] = {
+	{ KEY_F1, KEY_MUTE },
+	{ KEY_F2, KEY_VOLUMEDOWN },
+	{ KEY_F3, KEY_VOLUMEUP },
+	{ KEY_F5, KEY_BRIGHTNESSDOWN },
+	{ KEY_F6, KEY_BRIGHTNESSUP },
+	{ KEY_F8, KEY_EMOJI_PICKER },
+	{ KEY_F9, KEY_MICMUTE },
+	{ KEY_F10, KEY_CAMERA },
+	{ KEY_F11, KEY_F21 },
+	{ KEY_F12, KEY_PROG1 },
+};
+
+/*
+ * The keys which can be reported by the software Fn-Lock of the A14.
+ */
+static const u16 asus_software_fn_lock_keys[] = {
+	KEY_F1, KEY_F2, KEY_F3, KEY_F4, KEY_F5, KEY_F6, KEY_F7,
+	KEY_F8, KEY_F9, KEY_F10, KEY_F11, KEY_F12,
+	KEY_MUTE, KEY_VOLUMEDOWN, KEY_VOLUMEUP,
+	KEY_BRIGHTNESSDOWN, KEY_BRIGHTNESSUP,
+	KEY_EMOJI_PICKER, KEY_MICMUTE, KEY_CAMERA,
+	KEY_F21, KEY_PROG1, KEY_LEFTMETA, KEY_P,
+};
+
+/*
+ * Return the key code which has to be reported to userspace for the given
+ * key code, the key code itself if the key is not exchanged.
+ */
+static u16 asus_software_fn_lock_map_key(u16 key)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(asus_software_fn_lock_pairs); i++) {
+		if (asus_software_fn_lock_pairs[i].from == key)
+			return asus_software_fn_lock_pairs[i].to;
+		if (asus_software_fn_lock_pairs[i].to == key)
+			return asus_software_fn_lock_pairs[i].from;
+	}
+
+	/*
+	 * The Fn layer function of F4 is the keyboard backlight toggle, the
+	 * backlight toggle key of the firmware is a plain F4 key.
+	 */
+	if (key == KEY_KBDILLUMTOGGLE)
+		return KEY_F4;
+
+	return key;
+}
+
+/*
+ * Handle a key event of the software Fn-Lock of the ASUS Zenbook A14.
+ *
+ * Returns 1 if the event has been handled by the driver and must not be
+ * reported to userspace, 0 if the event should be reported unchanged.
+ *
+ * The reported events are synchronized by the HID input core after the
+ * complete report has been processed, they must not be synchronized
+ * separately.
+ */
+static int asus_software_fn_lock_event(struct asus_drvdata *drvdata,
+				       struct hid_usage *usage, __s32 value)
+{
+	struct input_dev *input = drvdata->input;
+	u16 code = usage->code;
+	u16 mapped;
+
+	if (usage->type != EV_KEY || !input)
+		return 0;
+
+	/*
+	 * The release of a key which is handled by the driver has to be
+	 * reported with the mapping which was latched when the key was
+	 * pressed, the Fn-Lock may have been toggled in between.
+	 */
+
+	/* The Meta key of the Meta+P chord. */
+	if (code == KEY_LEFTMETA) {
+		switch (drvdata->software_fn_lock_meta_state) {
+		case ASUS_SOFTWARE_FN_LOCK_META_NONE:
+			break;
+		case ASUS_SOFTWARE_FN_LOCK_META_PENDING:
+			/*
+			 * The Meta key was pressed and released without any
+			 * other key, the press was held back. Report the press
+			 * and the release, so that the key stays observable and
+			 * the reported keys stay balanced.
+			 */
+			if (!value) {
+				input_report_key(input, KEY_LEFTMETA, 1);
+				input_report_key(input, KEY_LEFTMETA, 0);
+				drvdata->software_fn_lock_meta_state =
+					ASUS_SOFTWARE_FN_LOCK_META_NONE;
+			}
+			return 1;
+		case ASUS_SOFTWARE_FN_LOCK_META_CHORD:
+			/* The Meta press was never reported. */
+			if (!value)
+				drvdata->software_fn_lock_meta_state =
+					ASUS_SOFTWARE_FN_LOCK_META_NONE;
+			return 1;
+		case ASUS_SOFTWARE_FN_LOCK_META_REPLAYED:
+			/* The Meta press was reported by the driver. */
+			if (!value) {
+				drvdata->software_fn_lock_meta_state =
+					ASUS_SOFTWARE_FN_LOCK_META_NONE;
+				input_report_key(input, KEY_LEFTMETA, 0);
+			} else if (value == 2) {
+				input_event(input, EV_KEY, KEY_LEFTMETA, 2);
+			}
+			return 1;
+		}
+	}
+
+	/*
+	 * The held back Meta key is resolved by the next event. Every event
+	 * but the P press of the Meta+P chord shows that the Meta key is a
+	 * genuine Meta key, the Meta key is reported before the event is
+	 * processed.
+	 */
+	if (drvdata->software_fn_lock_meta_state ==
+			ASUS_SOFTWARE_FN_LOCK_META_PENDING) {
+		if (code == KEY_P && value == 1 &&
+		    !test_bit(KEY_F7, drvdata->software_fn_lock_active) &&
+		    !test_bit(KEY_P, drvdata->software_fn_lock_active)) {
+			/*
+			 * The Meta+P chord is the Fn layer function of F7,
+			 * report it as a plain F7 key. A genuine physical
+			 * Meta+P chord is indistinguishable and is
+			 * intentionally interpreted as F7 too.
+			 */
+			drvdata->software_fn_lock_meta_state =
+				ASUS_SOFTWARE_FN_LOCK_META_CHORD;
+			set_bit(KEY_P, drvdata->software_fn_lock_active);
+			input_report_key(input, KEY_F7, 1);
+			return 1;
+		}
+
+		/*
+		 * A genuine Meta chord, report the Meta key and let the event
+		 * itself be reported as usual.
+		 */
+		drvdata->software_fn_lock_meta_state =
+			ASUS_SOFTWARE_FN_LOCK_META_REPLAYED;
+		input_report_key(input, KEY_LEFTMETA, 1);
+	}
+
+	/* The F7 key which is reported as the Meta+P chord. */
+	if (code == KEY_F7 &&
+	    test_bit(KEY_F7, drvdata->software_fn_lock_active)) {
+		if (!value) {
+			clear_bit(KEY_F7, drvdata->software_fn_lock_active);
+			/*
+			 * Release only the keys which have been acquired for the
+			 * chord, a physically held key must not be released.
+			 */
+			if (drvdata->software_fn_lock_f7_p) {
+				input_report_key(input, KEY_P, 0);
+				drvdata->software_fn_lock_f7_p = false;
+			}
+			if (drvdata->software_fn_lock_f7_meta) {
+				input_report_key(input, KEY_LEFTMETA, 0);
+				drvdata->software_fn_lock_f7_meta = false;
+			}
+		} else if (value == 2 && drvdata->software_fn_lock_f7_p) {
+			input_event(input, EV_KEY, KEY_P, 2);
+		}
+		return 1;
+	}
+
+	/* The Meta+P chord which is reported as the F7 key. */
+	if (code == KEY_P &&
+	    test_bit(KEY_P, drvdata->software_fn_lock_active)) {
+		if (!value) {
+			clear_bit(KEY_P, drvdata->software_fn_lock_active);
+			input_report_key(input, KEY_F7, 0);
+		} else if (value == 2) {
+			input_event(input, EV_KEY, KEY_F7, 2);
+		}
+		return 1;
+	}
+
+	/* The exchanged keys. */
+	mapped = asus_software_fn_lock_map_key(code);
+	if (mapped != code &&
+	    test_bit(code, drvdata->software_fn_lock_active)) {
+		if (!value) {
+			clear_bit(code, drvdata->software_fn_lock_active);
+			input_report_key(input, mapped, 0);
+		} else if (value == 2) {
+			input_event(input, EV_KEY, mapped, 2);
+		}
+		return 1;
+	}
+
+	/*
+	 * The plain F4 key is the backlight toggle key of the Fn layer, the
+	 * release has to be consumed even if the Fn-Lock was toggled while
+	 * the key was held.
+	 */
+	if (code == KEY_F4 &&
+	    test_bit(KEY_F4, drvdata->software_fn_lock_active)) {
+		if (!value)
+			clear_bit(KEY_F4, drvdata->software_fn_lock_active);
+		return 1;
+	}
+
+	/*
+	 * The Meta key is held back to resolve the Meta+P chord. The pending
+	 * state is independent of the current Fn-Lock state so that toggling the
+	 * Fn-Lock while Meta is held cannot change the meaning of the chord.
+	 * Only a press is held back, a release which does not follow a
+	 * held back press has to be reported to keep the reported keys
+	 * balanced.
+	 */
+	if (!drvdata->software_fn_lock && code == KEY_LEFTMETA && value == 1) {
+		/*
+		 * The firmware reports the Fn layer function of F7 as a Meta+P
+		 * chord, hold the Meta key back until the next key shows whether
+		 * this is the Fn layer function of F7 or a genuine Meta chord.
+		 */
+		drvdata->software_fn_lock_meta_state =
+			ASUS_SOFTWARE_FN_LOCK_META_PENDING;
+		return 1;
+	}
+
+	/*
+	 * Only the presses are mapped, the Fn-Lock has to be released.
+	 */
+	if (drvdata->software_fn_lock)
+		return 0;
+
+	/*
+	 * The plain F7 key is the Meta+P chord of the Fn layer, the chord is
+	 * only synthesised if no Meta key is involved. This keeps the projection
+	 * shortcut available from F7 even though an incoming Meta+P chord is
+	 * interpreted as F7.
+	 */
+	if (code == KEY_F7 && value == 1 &&
+	    drvdata->software_fn_lock_meta_state ==
+			ASUS_SOFTWARE_FN_LOCK_META_NONE) {
+		set_bit(KEY_F7, drvdata->software_fn_lock_active);
+
+		/*
+		 * Acquire only the keys of the chord which are not held
+		 * physically, the release of the F7 key must not release a
+		 * physically held key.
+		 */
+		if (!test_bit(KEY_LEFTMETA, input->key)) {
+			input_report_key(input, KEY_LEFTMETA, 1);
+			drvdata->software_fn_lock_f7_meta = true;
+		}
+		if (!test_bit(KEY_P, input->key)) {
+			input_report_key(input, KEY_P, 1);
+			drvdata->software_fn_lock_f7_p = true;
+		}
+		return 1;
+	}
+
+	/*
+	 * The plain F4 key is the backlight toggle key of the Fn layer. It is
+	 * handled before the generic direct-LED path so that it toggles exactly
+	 * once per physical press.
+	 */
+	if (code == KEY_F4 && value == 1) {
+		if (!asus_kbd_toggle_brightness(drvdata)) {
+			set_bit(KEY_F4, drvdata->software_fn_lock_active);
+			return 1;
+		}
+
+		return 0;
+	}
+
+	/* The exchanged keys. */
+	mapped = asus_software_fn_lock_map_key(code);
+	if (mapped != code && value == 1) {
+		set_bit(code, drvdata->software_fn_lock_active);
+		input_report_key(input, mapped, 1);
+		return 1;
+	}
+
+	return 0;
+}
+
+/*
+ * Clear the state of the software Fn-Lock. The keys which are still held
+ * are released, so that the keys reported to userspace stay balanced.
+ */
+static void asus_software_fn_lock_reset(struct asus_drvdata *drvdata,
+					bool release)
+{
+	struct input_dev *input = drvdata->input;
+	unsigned int code;
+	u16 mapped;
+	bool released = false;
+
+	for (code = find_first_bit(drvdata->software_fn_lock_active, KEY_CNT);
+	     code < KEY_CNT;
+	     code = find_next_bit(drvdata->software_fn_lock_active, KEY_CNT,
+				  code + 1)) {
+		clear_bit(code, drvdata->software_fn_lock_active);
+
+		if (!release || !input)
+			continue;
+
+		switch (code) {
+		case KEY_F7:
+			/* The Meta+P chord was reported instead. */
+			if (drvdata->software_fn_lock_f7_p) {
+				input_report_key(input, KEY_P, 0);
+				drvdata->software_fn_lock_f7_p = false;
+				released = true;
+			}
+			if (drvdata->software_fn_lock_f7_meta) {
+				input_report_key(input, KEY_LEFTMETA, 0);
+				drvdata->software_fn_lock_f7_meta = false;
+				released = true;
+			}
+			break;
+		case KEY_P:
+			/* The F7 key was reported instead. */
+			input_report_key(input, KEY_F7, 0);
+			released = true;
+			break;
+		case KEY_F4:
+			/* The key was consumed, there is nothing to release. */
+			break;
+		default:
+			mapped = asus_software_fn_lock_map_key(code);
+			if (mapped != code) {
+				input_report_key(input, mapped, 0);
+				released = true;
+			}
+			break;
+		}
+	}
+
+	if (drvdata->software_fn_lock_meta_state ==
+			ASUS_SOFTWARE_FN_LOCK_META_REPLAYED &&
+	    release && input) {
+		input_report_key(input, KEY_LEFTMETA, 0);
+		released = true;
+	}
+
+	drvdata->software_fn_lock_meta_state = ASUS_SOFTWARE_FN_LOCK_META_NONE;
+	drvdata->software_fn_lock_f7_meta = false;
+	drvdata->software_fn_lock_f7_p = false;
+
+	if (released)
+		input_sync(input);
+}
+
 static int asus_event(struct hid_device *hdev, struct hid_field *field,
 		      struct hid_usage *usage, __s32 value)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 	int ret;
+
+	/*
+	 * The software Fn-Lock of the A14 has to be handled before the other
+	 * handlers, the driver reports the exchanged keys itself.
+	 */
+	if ((drvdata->quirks & QUIRK_KBD_SOFTWARE_FN_LOCK) &&
+	    asus_software_fn_lock_event(drvdata, usage, value))
+		return 1;
 
 	if (usage->type == EV_KEY &&
 	    usage->code == KEY_KBDILLUMTOGGLE &&
@@ -521,6 +921,13 @@ static int asus_event(struct hid_device *hdev, struct hid_field *field,
 					hid_err(hdev, "Error while toggling FN lock: %d\n", ret);
 					return ret;
 				}
+			} else if ((drvdata->quirks & QUIRK_KBD_SOFTWARE_FN_LOCK) &&
+				   value == 1) {
+				/*
+				 * The Fn-Lock of the A14 is implemented in software, the
+				 * key itself is still reported to userspace.
+				 */
+				drvdata->software_fn_lock = !drvdata->software_fn_lock;
 			}
 			break;
 		}
@@ -1347,6 +1754,22 @@ static int asus_input_configured(struct hid_device *hdev, struct hid_input *hi)
 	    (asus_kbd_fn_lock_set(drvdata, true)))
 		hid_warn(hdev, "Error while setting FN lock to ON\n");
 
+	if (drvdata->quirks & QUIRK_KBD_SOFTWARE_FN_LOCK) {
+		size_t i;
+
+		/*
+		 * The software Fn-Lock exchanges the keys of the Fn layer with
+		 * their plain counterparts, make sure that all of the exchanged
+		 * keys are advertised to userspace.
+		 */
+		for (i = 0; i < ARRAY_SIZE(asus_software_fn_lock_keys); i++) {
+			if (!test_bit(asus_software_fn_lock_keys[i],
+				      input->keybit))
+				input_set_capability(input, EV_KEY,
+						     asus_software_fn_lock_keys[i]);
+		}
+	}
+
 	return 0;
 }
 
@@ -1592,6 +2015,9 @@ static int __maybe_unused asus_reset_resume(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 
+	/* The keys which are held during the reset are lost. */
+	asus_software_fn_lock_reset(drvdata, true);
+
 	if (!drvdata->tp)
 		asus_initialize_reports(hdev);
 
@@ -1616,6 +2042,13 @@ static int asus_probe(struct hid_device *hdev, const struct hid_device_id *id)
 	hid_set_drvdata(hdev, drvdata);
 
 	drvdata->quirks = id->driver_data;
+
+	/*
+	 * The software Fn-Lock of the A14 starts out engaged, which is the
+	 * behaviour of the firmware.
+	 */
+	if (drvdata->quirks & QUIRK_KBD_SOFTWARE_FN_LOCK)
+		drvdata->software_fn_lock = true;
 
 	/*
 	 * T90CHI's keyboard dock returns same ID values as T100CHI's dock.
@@ -1773,6 +2206,9 @@ static void asus_remove(struct hid_device *hdev)
 {
 	struct asus_drvdata *drvdata = hid_get_drvdata(hdev);
 
+	/* The keys which are handled by the driver are lost with it. */
+	asus_software_fn_lock_reset(drvdata, false);
+
 	if (drvdata->listener.brightness_set)
 		asus_hid_unregister_listener(&drvdata->listener);
 	if (drvdata->kbd_led_cdev.brightness_set_blocking)
@@ -1907,7 +2343,7 @@ static const struct hid_device_id asus_devices[] = {
 		USB_DEVICE_ID_ASUSTEK_I2C_ZENBOOK_A14_KEYBOARD),
 	  I2C_KEYBOARD_QUIRKS | QUIRK_USE_KBD_BACKLIGHT |
 	  QUIRK_KBD_REPORT_SIZE | QUIRK_KBD_DIRECT_LED |
-	  QUIRK_FILTER_CAMERA_COMPANION },
+	  QUIRK_FILTER_CAMERA_COMPANION | QUIRK_KBD_SOFTWARE_FN_LOCK },
 	{ HID_I2C_DEVICE(USB_VENDOR_ID_ASUSTEK,
 		USB_DEVICE_ID_ASUSTEK_I2C_TOUCHPAD), I2C_TOUCHPAD_QUIRKS },
 	{ HID_USB_DEVICE(USB_VENDOR_ID_ASUSTEK,
