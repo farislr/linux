@@ -7,6 +7,7 @@
  */
 // allow: SIZE_OK - I2C lifecycle and hwmon callbacks share EC state.
 
+#include <linux/atomic.h>
 #include <linux/cpufreq.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -21,10 +22,38 @@
 #include <linux/pm.h>
 #include <linux/pm_qos.h>
 #include <linux/slab.h>
+#include <linux/thermal.h>
+#include <linux/timekeeping.h>
 #include <linux/workqueue.h>
 
 #define DRV_NAME		"asus-zenbook-a14-ec"
 #define HWMON_NAME		"asus_zenbook_a14_ec"
+
+static bool read_c6_once;
+module_param(read_c6_once, bool, 0);
+MODULE_PARM_DESC(read_c6_once,
+		 "Read EC register C6:00 once at probe for diagnostics");
+
+/* Hidden: delayed C6:00 read, exposed via the hwmon c6_read_once attribute. */
+static bool read_c6_delayed;
+module_param(read_c6_delayed, bool, 0);
+
+/* Uptime after which the delayed C6:00 read is allowed. */
+#define C6_DELAY_NS	(900ULL * NSEC_PER_SEC)
+
+static bool tj_feed;
+module_param(tj_feed, bool, 0);
+MODULE_PARM_DESC(tj_feed,
+		 "Feed the hottest SoC thermal zone temperature to EC mailbox C6:00 once per second (experimental, UX3407QA only)");
+
+/* Host SoC temperature mailbox, written by the Windows driver. */
+#define EC_TJ_MAJ		0xc6
+#define EC_TJ_MIN		0x00
+#define EC_TJ_SAFE		0x4b	/* EC boot default (75 C) */
+#define EC_TJ_MIN_C		20
+#define EC_TJ_MAX_C		120
+#define EC_TJ_INTERVAL_MS	1000
+#define EC_TJ_MAX_FAIL		5
 
 #define EC_I2C_ADDR		0x5b
 
@@ -105,6 +134,10 @@ struct asus_ec {
 	bool			freq_qos_ok;
 
 	struct device		*hwmon_dev;
+	bool			c6_delayed;
+	struct delayed_work	tj_work;
+	unsigned int		tj_fail;
+	bool			tj_started;
 	struct delayed_work	curve_work;
 	bool			curve_enabled;
 	bool			curve_suspended;
@@ -291,6 +324,39 @@ static int asus_ec_read_reg(struct asus_ec *ec, u8 maj, u8 min, u8 *out)
 	ret = __ec_cr(ec, maj, min, out);
 	mutex_unlock(&ec->lock);
 	return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* One-shot direct EC read of C6:00                                   */
+/* ------------------------------------------------------------------ */
+
+/* Global per-boot attempt latch: the read is never retried, not even
+ * after a failed transfer.
+ */
+static atomic_t c6_attempted = ATOMIC_INIT(0);
+
+/*
+ * Perform the single direct EC transfer of register C6:00.
+ * Returns 0 and stores the raw byte in @raw on success, -EALREADY if the
+ * per-boot attempt was already used, or -EIO on transfer failure.
+ */
+static int asus_ec_read_c6_once(struct asus_ec *ec, u8 *raw)
+{
+	int ret;
+
+	if (atomic_xchg(&c6_attempted, 1))
+		return -EALREADY;
+
+	mutex_lock(&ec->lock);
+	ret = __ec_rb(ec, 0xc6, 0x00, raw);
+	mutex_unlock(&ec->lock);
+	if (ret) {
+		dev_err(ec->dev, "C6:00 read failed: %d\n", ret);
+		return -EIO;
+	}
+
+	dev_info(ec->dev, "C6:00 raw=0x%02x\n", *raw);
+	return 0;
 }
 
 static int asus_ec_read_temp_input(struct asus_ec *ec, long *temp_mc)
@@ -1125,16 +1191,55 @@ static DEVICE_ATTR_RW(fan_curve_interval_ms);
 static DEVICE_ATTR_RW(fan_curve_points);
 static DEVICE_ATTR_RW(fan_curve_hysteresis_c);
 
+/*
+ * Delayed C6:00 read. The transfer is performed on first read, but only
+ * once the machine has been up for C6_DELAY_NS; the per-boot latch makes
+ * sure the EC is touched at most once.
+ */
+static ssize_t c6_read_once_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	struct asus_ec *ec = dev_get_drvdata(dev);
+	u8 raw;
+	int ret;
+
+	if (ktime_get_ns() < C6_DELAY_NS)
+		return -EAGAIN;
+
+	ret = asus_ec_read_c6_once(ec, &raw);
+	if (ret)
+		return ret;
+
+	return sysfs_emit(buf, "0x%02x\n", raw);
+}
+
+static DEVICE_ATTR_ADMIN_RO(c6_read_once);
+
 static struct attribute *asus_ec_curve_attrs[] = {
 	&dev_attr_fan_curve_enable.attr,
 	&dev_attr_fan_curve_interval_ms.attr,
 	&dev_attr_fan_curve_points.attr,
 	&dev_attr_fan_curve_hysteresis_c.attr,
+	&dev_attr_c6_read_once.attr,
 	NULL,
 };
 
+/* The C6:00 attribute is only exposed for the delayed native device. */
+static umode_t asus_ec_curve_attr_is_visible(struct kobject *kobj,
+					     struct attribute *attr, int n)
+{
+	const struct device *hwmon_dev = kobj_to_dev(kobj);
+	struct asus_ec *ec = dev_get_drvdata(hwmon_dev);
+
+	if (attr == &dev_attr_c6_read_once.attr)
+		return ec && ec->c6_delayed ? 0400 : 0;
+
+	return attr->mode;
+}
+
 static const struct attribute_group asus_ec_curve_attr_group = {
 	.attrs = asus_ec_curve_attrs,
+	.is_visible = asus_ec_curve_attr_is_visible,
 };
 
 /* ------------------------------------------------------------------ */
@@ -1347,6 +1452,103 @@ static const struct hwmon_chip_info asus_ec_hwmon_chip_info = {
 };
 
 /* ------------------------------------------------------------------ */
+/* SoC temperature feed                                               */
+/* ------------------------------------------------------------------ */
+
+static const char * const asus_ec_tj_zones[] = {
+	"cpuss0-top-thermal", "cpuss0-btm-thermal",
+	"cpuss1-top-thermal", "cpuss1-btm-thermal",
+	"mem-thermal",
+	"nsp0-thermal", "nsp1-thermal", "nsp2-thermal", "nsp3-thermal",
+	"gpuss-0-thermal", "gpuss-1-thermal",
+	"gpuss-2-thermal", "gpuss-3-thermal",
+	"cpu0-0-top-thermal", "cpu0-0-btm-thermal",
+	"cpu0-1-top-thermal", "cpu0-1-btm-thermal",
+	"cpu0-2-top-thermal", "cpu0-2-btm-thermal",
+	"cpu0-3-top-thermal", "cpu0-3-btm-thermal",
+	"cpu1-0-top-thermal", "cpu1-0-btm-thermal",
+	"cpu1-1-top-thermal", "cpu1-1-btm-thermal",
+	"cpu1-2-top-thermal", "cpu1-2-btm-thermal",
+	"cpu1-3-top-thermal", "cpu1-3-btm-thermal",
+};
+
+/* Hottest readable SoC zone in whole degrees C; -ENODATA if none reads. */
+static int asus_ec_soc_tj(int *tj_c)
+{
+	int best = INT_MIN;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(asus_ec_tj_zones); i++) {
+		struct thermal_zone_device *tz;
+		int temp;
+
+		tz = thermal_zone_get_zone_by_name(asus_ec_tj_zones[i]);
+		if (IS_ERR(tz) || thermal_zone_get_temp(tz, &temp))
+			continue;
+		best = max(best, temp);
+	}
+	if (best == INT_MIN)
+		return -ENODATA;
+
+	*tj_c = best / 1000;
+	return 0;
+}
+
+static void asus_ec_tj_work(struct work_struct *work)
+{
+	struct asus_ec *ec = container_of(to_delayed_work(work),
+					  struct asus_ec, tj_work);
+	u8 val = EC_TJ_SAFE;
+	int tj, ret;
+
+	if (!asus_ec_soc_tj(&tj))
+		val = clamp(tj, EC_TJ_MIN_C, EC_TJ_MAX_C);
+
+	mutex_lock(&ec->lock);
+	ret = __ec_wb(ec, EC_TJ_MAJ, EC_TJ_MIN, val);
+	mutex_unlock(&ec->lock);
+
+	if (!ret) {
+		ec->tj_fail = 0;
+	} else if (++ec->tj_fail >= EC_TJ_MAX_FAIL) {
+		dev_warn(ec->dev, "Tj feed stopped after %u write failures: %d\n",
+			 ec->tj_fail, ret);
+		return;
+	}
+
+	queue_delayed_work(system_wq, &ec->tj_work,
+			   msecs_to_jiffies(EC_TJ_INTERVAL_MS));
+}
+
+static void asus_ec_tj_start(struct asus_ec *ec)
+{
+	if (!tj_feed ||
+	    !of_device_is_compatible(ec->dev->of_node,
+				     "asus,zenbook-a14-ux3407qa-ec") ||
+	    ec->client->addr != EC_I2C_ADDR)
+		return;
+
+	dev_info_once(ec->dev, "Tj feed enabled\n");
+	ec->tj_fail = 0;
+	ec->tj_started = true;
+	queue_delayed_work(system_wq, &ec->tj_work, 0);
+}
+
+/* Stop the feed and put the EC default back; safe to call repeatedly. */
+static void asus_ec_tj_stop(struct asus_ec *ec)
+{
+	if (!ec->tj_started)
+		return;
+
+	cancel_delayed_work_sync(&ec->tj_work);
+
+	mutex_lock(&ec->lock);
+	(void)__ec_wb(ec, EC_TJ_MAJ, EC_TJ_MIN, EC_TJ_SAFE);
+	mutex_unlock(&ec->lock);
+	ec->tj_started = false;
+}
+
+/* ------------------------------------------------------------------ */
 /* probe / remove                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -1368,6 +1570,7 @@ static int asus_zenbook_a14_ec_probe(struct i2c_client *client)
 	mutex_init(&ec->mode_lock);
 	mutex_init(&ec->curve_lock);
 	INIT_DELAYED_WORK(&ec->curve_work, asus_ec_curve_work);
+	INIT_DELAYED_WORK(&ec->tj_work, asus_ec_tj_work);
 	ec->curve_interval_ms = FC_DEFAULT_INTERVAL_MS;
 	ec->curve_hysteresis_c = FC_DEFAULT_HYSTERESIS_C;
 	ec->curve_nr_points = 5;
@@ -1383,6 +1586,23 @@ static int asus_zenbook_a14_ec_probe(struct i2c_client *client)
 	ec->curve_pwms[4] = 255;
 	ec->curve_last_temp = -1;
 	i2c_set_clientdata(client, ec);
+
+	if (of_device_is_compatible(dev->of_node, "asus,zenbook-a14-ux3407qa-ec") &&
+	    client->addr == EC_I2C_ADDR) {
+		if (read_c6_delayed) {
+			/* Delayed mode: the read is triggered from sysfs. */
+			ec->c6_delayed = true;
+		} else if (read_c6_once) {
+			u8 raw;
+
+			/* One direct read per boot only. */
+			ret = asus_ec_read_c6_once(ec, &raw);
+			if (ret == -EALREADY)
+				return -ENODEV;
+			if (ret)
+				return -EIO;
+		}
+	}
 
 	ret = asus_ec_read_reg(ec, EC_REG_FAN_MODE_MAJ, EC_REG_FAN_MODE_RMIN,
 			       &mode);
@@ -1426,6 +1646,8 @@ static int asus_zenbook_a14_ec_probe(struct i2c_client *client)
 			 "platform_profile registered (quiet/balanced/performance)\n");
 	}
 
+	asus_ec_tj_start(ec);
+
 	return 0;
 }
 
@@ -1436,6 +1658,7 @@ static void asus_zenbook_a14_ec_remove(struct i2c_client *client)
 	if (!ec)
 		return;
 
+	asus_ec_tj_stop(ec);
 	sysfs_remove_group(&ec->hwmon_dev->kobj, &asus_ec_curve_attr_group);
 	(void)asus_ec_curve_disable(ec);
 	cancel_delayed_work_sync(&ec->curve_work);
@@ -1453,6 +1676,7 @@ static void asus_zenbook_a14_ec_shutdown(struct i2c_client *client)
 	if (!ec)
 		return;
 
+	asus_ec_tj_stop(ec);
 	(void)asus_ec_curve_disable(ec);
 	cancel_delayed_work_sync(&ec->curve_work);
 }
@@ -1468,6 +1692,8 @@ static int asus_ec_prepare(struct device *dev)
 
 	if (!ec)
 		return 0;
+
+	asus_ec_tj_stop(ec);
 
 	mutex_lock(&ec->curve_lock);
 	mutex_lock(&ec->mode_lock);
@@ -1502,6 +1728,9 @@ static int asus_ec_prepare(struct device *dev)
 out_unlock_mode:
 	mutex_unlock(&ec->mode_lock);
 	mutex_unlock(&ec->curve_lock);
+
+	if (ret)
+		asus_ec_tj_start(ec);
 
 	return ret;
 }
@@ -1574,6 +1803,8 @@ static void asus_ec_complete(struct device *dev)
 
 	mutex_unlock(&ec->mode_lock);
 	mutex_unlock(&ec->curve_lock);
+
+	asus_ec_tj_start(ec);
 }
 
 static const struct dev_pm_ops asus_zenbook_a14_ec_pm_ops = {
