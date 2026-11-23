@@ -41,10 +41,10 @@ module_param(read_c6_delayed, bool, 0);
 /* Uptime after which the delayed C6:00 read is allowed. */
 #define C6_DELAY_NS	(900ULL * NSEC_PER_SEC)
 
-static bool tj_feed;
+static bool tj_feed = true;
 module_param(tj_feed, bool, 0);
 MODULE_PARM_DESC(tj_feed,
-		 "Feed the hottest SoC thermal zone temperature to EC mailbox C6:00 once per second (experimental, UX3407QA only)");
+		 "Feed SoC temperature to EC mailbox C6:00 (UX3407QA only, default: on; set to 0 to disable)");
 
 /* Host SoC temperature mailbox, written by the Windows driver. */
 #define EC_TJ_MAJ		0xc6
@@ -1552,7 +1552,7 @@ static void asus_ec_tj_stop(struct asus_ec *ec)
 /* probe / remove                                                     */
 /* ------------------------------------------------------------------ */
 
-static int asus_zenbook_a14_ec_probe(struct i2c_client *client)
+static int asus_hamoa_ec_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
 	struct asus_ec *ec;
@@ -1651,7 +1651,7 @@ static int asus_zenbook_a14_ec_probe(struct i2c_client *client)
 	return 0;
 }
 
-static void asus_zenbook_a14_ec_remove(struct i2c_client *client)
+static void asus_hamoa_ec_remove(struct i2c_client *client)
 {
 	struct asus_ec *ec = i2c_get_clientdata(client);
 
@@ -1669,7 +1669,7 @@ static void asus_zenbook_a14_ec_remove(struct i2c_client *client)
 	dev_info(&client->dev, "removed\n");
 }
 
-static void asus_zenbook_a14_ec_shutdown(struct i2c_client *client)
+static void asus_hamoa_ec_shutdown(struct i2c_client *client)
 {
 	struct asus_ec *ec = i2c_get_clientdata(client);
 
@@ -1807,37 +1807,37 @@ static void asus_ec_complete(struct device *dev)
 	asus_ec_tj_start(ec);
 }
 
-static const struct dev_pm_ops asus_zenbook_a14_ec_pm_ops = {
+static const struct dev_pm_ops asus_hamoa_ec_pm_ops = {
 	.prepare	= asus_ec_prepare,
 	.suspend	= asus_ec_suspend,
 	.resume		= asus_ec_resume,
 	.complete	= asus_ec_complete,
 };
 
-static const struct of_device_id asus_zenbook_a14_ec_of_match[] = {
+static const struct of_device_id asus_hamoa_ec_of_match[] = {
 	{ .compatible = "asus,zenbook-a14-ux3407qa-ec" },
 	{ }
 };
-MODULE_DEVICE_TABLE(of, asus_zenbook_a14_ec_of_match);
+MODULE_DEVICE_TABLE(of, asus_hamoa_ec_of_match);
 
-static const struct i2c_device_id asus_zenbook_a14_ec_id[] = {
+static const struct i2c_device_id asus_hamoa_ec_id[] = {
 	{ "asus-zenbook-a14-ec", 0 },
 	{ }
 };
-MODULE_DEVICE_TABLE(i2c, asus_zenbook_a14_ec_id);
+MODULE_DEVICE_TABLE(i2c, asus_hamoa_ec_id);
 
-static struct i2c_driver asus_zenbook_a14_ec_driver = {
+static struct i2c_driver asus_hamoa_ec_driver = {
 	.driver = {
 		.name = DRV_NAME,
-		.of_match_table = asus_zenbook_a14_ec_of_match,
-		.pm = &asus_zenbook_a14_ec_pm_ops,
+		.of_match_table = asus_hamoa_ec_of_match,
+		.pm = &asus_hamoa_ec_pm_ops,
 	},
-	.probe = asus_zenbook_a14_ec_probe,
-	.remove = asus_zenbook_a14_ec_remove,
-	.shutdown = asus_zenbook_a14_ec_shutdown,
-	.id_table = asus_zenbook_a14_ec_id,
+	.probe = asus_hamoa_ec_probe,
+	.remove = asus_hamoa_ec_remove,
+	.shutdown = asus_hamoa_ec_shutdown,
+	.id_table = asus_hamoa_ec_id,
 };
-module_i2c_driver(asus_zenbook_a14_ec_driver);
+module_i2c_driver(asus_hamoa_ec_driver);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("ASUS Zenbook A14 UX3407QA EC driver");
