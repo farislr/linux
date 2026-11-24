@@ -18,6 +18,19 @@
 #define OV02C10_MCLK			19200000
 #define OV02C10_RGB_DEPTH		10
 
+/*
+ * Pixel array geometry. The sensor's full pixel array is 1928x1092 pixels and
+ * contains a centered 1920x1080 active area, i.e. with a 4 pixel margin on
+ * the left and a 6 pixel margin on the top. The V4L2 source format stays
+ * 1928x1092; the selection rectangle marks the usable active region.
+ */
+#define OV02C10_NATIVE_WIDTH		1928U
+#define OV02C10_NATIVE_HEIGHT		1092U
+#define OV02C10_ACTIVE_LEFT		4U
+#define OV02C10_ACTIVE_TOP		6U
+#define OV02C10_ACTIVE_WIDTH		1920U
+#define OV02C10_ACTIVE_HEIGHT		1080U
+
 #define OV02C10_REG_CHIP_ID		CCI_REG24(0x300a)
 #define OV02C10_CHIP_ID			0x560243
 
@@ -756,6 +769,34 @@ static int ov02c10_enum_frame_size(struct v4l2_subdev *sd,
 	return 0;
 }
 
+static int ov02c10_get_selection(struct v4l2_subdev *sd,
+				 const struct v4l2_subdev_client_info *ci,
+				 struct v4l2_subdev_state *sd_state,
+				 struct v4l2_subdev_selection *sel)
+{
+	if (sel->pad)
+		return -EINVAL;
+
+	switch (sel->target) {
+	case V4L2_SEL_TGT_CROP:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+		sel->r.left = OV02C10_ACTIVE_LEFT;
+		sel->r.top = OV02C10_ACTIVE_TOP;
+		sel->r.width = OV02C10_ACTIVE_WIDTH;
+		sel->r.height = OV02C10_ACTIVE_HEIGHT;
+		return 0;
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+	case V4L2_SEL_TGT_NATIVE_SIZE:
+		sel->r.left = 0;
+		sel->r.top = 0;
+		sel->r.width = OV02C10_NATIVE_WIDTH;
+		sel->r.height = OV02C10_NATIVE_HEIGHT;
+		return 0;
+	default:
+		return -EINVAL;
+	}
+}
+
 static int ov02c10_init_state(struct v4l2_subdev *sd,
 			      struct v4l2_subdev_state *sd_state)
 {
@@ -774,6 +815,7 @@ static const struct v4l2_subdev_pad_ops ov02c10_pad_ops = {
 	.get_fmt = v4l2_subdev_get_fmt,
 	.enum_mbus_code = ov02c10_enum_mbus_code,
 	.enum_frame_size = ov02c10_enum_frame_size,
+	.get_selection = ov02c10_get_selection,
 	.enable_streams = ov02c10_enable_streams,
 	.disable_streams = ov02c10_disable_streams,
 };
